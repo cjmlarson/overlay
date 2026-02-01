@@ -242,9 +242,9 @@ def dp_skyline(
     # --- Forward pass ---
 
     # Initialize first column: entry cost = (i+1)^2 for edge pixels
-    for i in range(M):
-        if edge_map[i, 0]:
-            cost[i, 0] = (i + 1) ** 2
+    rows = np.arange(M)
+    mask = edge_map[:, 0]
+    cost[mask, 0] = (rows[mask] + 1) ** 2
 
     # Process columns left to right
     for j in range(1, N):
@@ -256,7 +256,7 @@ def dp_skyline(
             best_row = -1
             best_col = -1
 
-            # Search backward for valid predecessors
+            # Search backward for valid predecessors (vectorized)
             for d in range(1, min(tog, j) + 1):
                 prev_j = j - d
 
@@ -264,27 +264,30 @@ def dp_skyline(
                 # At distance d, search ±(delta + d - 1) rows
                 search_range = delta + d - 1
 
-                for prev_i in range(max(0, i - search_range), min(M, i + search_range + 1)):
-                    if not edge_map[prev_i, prev_j]:
-                        continue
-                    if cost[prev_i, prev_j] == np.inf:
-                        continue
+                lo = max(0, i - search_range)
+                hi = min(M, i + search_range + 1)
+                prev_i_arr = np.arange(lo, hi)
 
-                    # Link cost: |h-k| for direct neighbors, plus gap penalty
-                    link_cost = abs(i - prev_i)
-                    if d > 1:
-                        # Add penalty for each dummy link (d-1 gaps)
-                        link_cost += (d - 1) * pun
+                # Filter to valid predecessors (edge pixels with finite cost)
+                valid = edge_map[prev_i_arr, prev_j] & np.isfinite(cost[prev_i_arr, prev_j])
+                if not valid.any():
+                    continue
 
-                    total = cost[prev_i, prev_j] + link_cost
+                candidates = prev_i_arr[valid]
 
-                    if total < best_cost:
-                        best_cost = total
-                        best_row = prev_i
-                        best_col = prev_j
+                # Link cost: |h-k| for direct neighbors, plus gap penalty
+                gap_penalty = (d - 1) * pun if d > 1 else 0
+                link_costs = np.abs(i - candidates) + gap_penalty
+                totals = cost[candidates, prev_j] + link_costs
 
-                # If we found a valid predecessor at this distance, stop searching
-                if best_row >= 0 and d == 1:
+                best_idx = np.argmin(totals)
+                if totals[best_idx] < best_cost:
+                    best_cost = totals[best_idx]
+                    best_row = candidates[best_idx]
+                    best_col = prev_j
+
+                # If we found a valid predecessor at distance 1, stop searching
+                if d == 1 and best_row >= 0:
                     break
 
             if best_row >= 0:
@@ -293,9 +296,8 @@ def dp_skyline(
                 parent_col[i, j] = best_col
 
     # Add exit cost at final column
-    for i in range(M):
-        if edge_map[i, N - 1] and cost[i, N - 1] < np.inf:
-            cost[i, N - 1] += (i + 1) ** 2
+    exit_mask = edge_map[:, N - 1] & np.isfinite(cost[:, N - 1])
+    cost[exit_mask, N - 1] += (rows[exit_mask] + 1) ** 2
 
     # --- Backward pass ---
 
