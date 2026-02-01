@@ -193,6 +193,34 @@ def get_elevation_at(tile_urls: list[str], easting: float, northing: float) -> f
     raise ValueError(f"Could not get elevation at E={easting}, N={northing}")
 
 
+def compute_hillshade(Z: np.ndarray, azimuth: float = 315, altitude: float = 45) -> np.ndarray:
+    """Compute hillshade from elevation data.
+
+    Args:
+        Z: Elevation array
+        azimuth: Light source azimuth in degrees (315 = NW)
+        altitude: Light source altitude in degrees above horizon
+    """
+    # Convert to radians
+    az_rad = np.radians(azimuth)
+    alt_rad = np.radians(altitude)
+
+    # Compute gradients
+    dy, dx = np.gradient(Z)
+
+    # Compute slope and aspect
+    slope = np.arctan(np.sqrt(dx**2 + dy**2))
+    aspect = np.arctan2(-dx, dy)
+
+    # Compute hillshade
+    shade = (np.sin(alt_rad) * np.cos(slope) +
+             np.cos(alt_rad) * np.sin(slope) * np.cos(az_rad - aspect))
+
+    # Normalize to 0-1
+    shade = (shade - shade.min()) / (shade.max() - shade.min())
+    return shade
+
+
 def render_view(X: np.ndarray, Y: np.ndarray, Z: np.ndarray,
                 cam_e: float, cam_n: float, cam_z: float,
                 output_path: str, azimuth: float = 90):
@@ -204,44 +232,43 @@ def render_view(X: np.ndarray, Y: np.ndarray, Z: np.ndarray,
         output_path: Path to save output PNG
         azimuth: Direction to face in degrees (0=north, 90=east, etc.)
     """
-    fig = plt.figure(figsize=(12, 8))
-    ax = fig.add_subplot(111, projection='3d')
+    fig = plt.figure(figsize=(14, 10), facecolor='white')
+    ax = fig.add_subplot(111, projection='3d', facecolor='white')
 
-    # Subsample for performance if needed
-    step = max(1, min(X.shape) // 200)
+    # Subsample for performance
+    step = max(1, min(X.shape) // 150)
     Xs = X[::step, ::step]
     Ys = Y[::step, ::step]
     Zs = Z[::step, ::step]
 
-    # Plot terrain surface
-    ax.plot_surface(Xs, Ys, Zs, cmap='terrain', alpha=0.9,
-                    linewidth=0, antialiased=True)
+    # Compute hillshade for coloring
+    shade = compute_hillshade(Zs, azimuth=315, altitude=35)
 
-    # Mark camera position
-    ax.scatter([cam_e], [cam_n], [cam_z], color='red', s=100,
-               marker='^', label='Camera')
+    # Create grayscale colormap from hillshade
+    from matplotlib.colors import LightSource
+    ls = LightSource(azdeg=315, altdeg=35)
+    rgb = ls.shade(Zs, cmap=plt.cm.gray, vert_exag=1, blend_mode='soft')
+
+    # Plot as wireframe mesh with hillshade surface underneath
+    ax.plot_surface(Xs, Ys, Zs, facecolors=rgb, linewidth=0,
+                    antialiased=True, shade=False)
+
+    # Add subtle wireframe on top
+    wire_step = max(1, step * 3)
+    Xw = X[::wire_step, ::wire_step]
+    Yw = Y[::wire_step, ::wire_step]
+    Zw = Z[::wire_step, ::wire_step]
+    ax.plot_wireframe(Xw, Yw, Zw, color='#404040', linewidth=0.3, alpha=0.4)
 
     # Set view angle
-    # Matplotlib 3D uses: elev = angle above xy plane, azim = rotation around z
-    # azim=0 looks along +x (east), azim=90 looks along +y (north)
-    # For facing east (azim=90 in compass), we want matplotlib azim=0
     mpl_azim = 90 - azimuth  # Convert compass to matplotlib convention
+    ax.view_init(elev=5, azim=mpl_azim)
 
-    # Calculate elevation angle (looking slightly down at terrain)
-    terrain_center_z = np.mean(Zs)
-    elev_angle = -5  # Slight downward tilt
-
-    ax.view_init(elev=elev_angle, azim=mpl_azim)
-
-    # Labels
-    ax.set_xlabel('Easting (m)')
-    ax.set_ylabel('Northing (m)')
-    ax.set_zlabel('Elevation (m)')
-    ax.set_title(f'DEM View from ({cam_e:.0f}, {cam_n:.0f}, {cam_z:.0f}m)\n'
-                 f'Facing {azimuth}° (East)')
+    # Remove all axes, gridlines, and panes
+    ax.set_axis_off()
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"Saved: {output_path}")
 
