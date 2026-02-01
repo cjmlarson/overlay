@@ -245,9 +245,12 @@ def render_view(X: np.ndarray, Y: np.ndarray, Z: np.ndarray,
     shade = compute_hillshade(Zs, azimuth=315, altitude=35)
 
     # Create grayscale colormap from hillshade
+    # Cap brightness so peaks aren't pure white against background
     from matplotlib.colors import LightSource
     ls = LightSource(azdeg=315, altdeg=35)
     rgb = ls.shade(Zs, cmap=plt.cm.gray, vert_exag=1, blend_mode='soft')
+    # Darken: scale RGB values to max 0.85 so bright areas still visible
+    rgb[..., :3] = rgb[..., :3] * 0.8 + 0.05
 
     # Plot as wireframe mesh with hillshade surface underneath
     ax.plot_surface(Xs, Ys, Zs, facecolors=rgb, linewidth=0,
