@@ -1,1 +1,2 @@
 - https://github.com/brejchajan/LandscapeAR may be a useful reference
+- we're using 'uv run' and 'uv add' (not pip or python3 directly!)
