@@ -129,7 +129,8 @@ def build_graph_and_search(
     """
     DP search for minimum-cost skyline path.
 
-    Uses full edge map and finds optimal path considering:
+    Optimized implementation using topmost edges per column.
+    Cost function:
     - Vertex cost: (row+1)^2 at entry/exit (favors upper positions)
     - Link cost: |vertical_jump| for smoothness
     - Gap penalty: pun * gap_size when bridging
@@ -145,140 +146,106 @@ def build_graph_and_search(
     """
     height, width = edge_map.shape
 
-    # Pre-compute edge row indices for each column for efficiency
-    edge_rows = [np.where(edge_map[:, col])[0] for col in range(width)]
+    # Find topmost edge in each column - these are our skyline candidates
+    # This is much more efficient than tracking all edges
+    topmost = np.full(width, -1, dtype=np.int32)
+    for col in range(width):
+        edges = np.where(edge_map[:, col])[0]
+        if len(edges) > 0:
+            topmost[col] = edges[0]
 
-    # Ensure first and last columns have entry/exit points
-    # If no edges, use the topmost edge from nearest column with edges
-    if len(edge_rows[0]) == 0:
-        for col in range(1, width):
-            if len(edge_rows[col]) > 0:
-                edge_rows[0] = edge_rows[col][:1]  # Use topmost
-                break
+    # Find valid column ranges
+    valid_cols = np.where(topmost >= 0)[0]
+    if len(valid_cols) == 0:
+        return np.full(width, -1, dtype=np.int32)
 
-    if len(edge_rows[-1]) == 0:
-        for col in range(width - 2, -1, -1):
-            if len(edge_rows[col]) > 0:
-                edge_rows[-1] = edge_rows[col][:1]
-                break
+    first_valid = valid_cols[0]
+    last_valid = valid_cols[-1]
 
-    # DP using sparse representation for efficiency
-    # cost[col] = dict mapping row -> (min_cost, parent_col, parent_row)
+    # DP arrays
     INF = float('inf')
+    cost = np.full(width, INF, dtype=np.float64)
+    parent = np.full(width, -1, dtype=np.int32)
 
-    # Initialize first column with entry vertex costs
-    cost = [{} for _ in range(width)]
-    for row in edge_rows[0]:
-        entry_cost = (row + 1) ** 2
-        cost[0][row] = (entry_cost, -1, -1)
+    # Initialize first valid column with entry vertex cost
+    cost[first_valid] = (topmost[first_valid] + 1) ** 2
 
-    # Forward pass
-    for col in range(1, width):
-        col_edges = edge_rows[col]
-        if len(col_edges) == 0:
-            continue
+    # Forward pass - only process valid columns
+    for i in range(1, len(valid_cols)):
+        col = valid_cols[i]
+        row = topmost[col]
 
-        # For efficiency, only consider edges within range of reachable positions
-        # from previous columns
-        for row in col_edges:
-            best_cost = INF
-            best_parent = (-1, -1)
+        best_cost = INF
+        best_parent = -1
 
-            # Check direct connections from previous column
-            if cost[col - 1]:
-                for prev_row, (prev_cost, _, _) in cost[col - 1].items():
-                    if abs(row - prev_row) <= delta:
-                        link_cost = abs(row - prev_row)
-                        total = prev_cost + link_cost
-                        if total < best_cost:
-                            best_cost = total
-                            best_parent = (col - 1, prev_row)
+        # Look back at previous valid columns within tog range
+        for j in range(i - 1, -1, -1):
+            prev_col = valid_cols[j]
+            gap = col - prev_col
 
-            # Check gap bridging if no direct connection found
-            if best_cost == INF:
-                for gap in range(2, min(tog + 1, col + 1)):
-                    prev_col = col - gap
-                    if not cost[prev_col]:
-                        continue
+            if gap > tog:
+                break  # Too far back
 
-                    max_jump = delta * gap  # Allow proportional jump for gaps
-                    for prev_row, (prev_cost, _, _) in cost[prev_col].items():
-                        if abs(row - prev_row) <= max_jump:
-                            link_cost = abs(row - prev_row)
-                            gap_penalty = pun * (gap - 1)
-                            total = prev_cost + link_cost + gap_penalty
-                            if total < best_cost:
-                                best_cost = total
-                                best_parent = (prev_col, prev_row)
+            if cost[prev_col] == INF:
+                continue
 
-                    if best_cost < INF:
-                        break  # Found connection, stop looking further back
+            prev_row = topmost[prev_col]
+            max_jump = delta * gap  # Allow proportional jump for gaps
 
-            if best_cost < INF:
-                cost[col][row] = (best_cost, best_parent[0], best_parent[1])
+            if abs(row - prev_row) <= max_jump:
+                link_cost = abs(row - prev_row)
+                gap_penalty = pun * (gap - 1) if gap > 1 else 0
+                total = cost[prev_col] + link_cost + gap_penalty
 
-    # Find best endpoint in last column (adding exit vertex cost)
+                if total < best_cost:
+                    best_cost = total
+                    best_parent = prev_col
+
+        if best_cost < INF:
+            cost[col] = best_cost
+            parent[col] = best_parent
+
+    # Add exit vertex cost to reachable columns and find best endpoint
     best_end_cost = INF
-    best_end_row = -1
+    best_end_col = -1
 
-    # Check last column
-    for row, (row_cost, _, _) in cost[-1].items():
-        exit_cost = (row + 1) ** 2
-        total = row_cost + exit_cost
-        if total < best_end_cost:
-            best_end_cost = total
-            best_end_row = row
+    for col in valid_cols:
+        if cost[col] < INF:
+            exit_cost = (topmost[col] + 1) ** 2
+            total = cost[col] + exit_cost
+            if total < best_end_cost:
+                best_end_cost = total
+                best_end_col = col
 
-    # If last column unreachable, find best reachable endpoint
-    end_col = width - 1
-    if best_end_row < 0:
-        for col in range(width - 1, -1, -1):
-            for row, (row_cost, _, _) in cost[col].items():
-                exit_cost = (row + 1) ** 2
-                total = row_cost + exit_cost
-                if total < best_end_cost:
-                    best_end_cost = total
-                    best_end_row = row
-                    end_col = col
-            if best_end_row >= 0:
-                break
-
-    if best_end_row < 0:
+    if best_end_col < 0:
         return np.full(width, -1, dtype=np.int32)
 
     # Backtrack to reconstruct path
     skyline = np.full(width, -1, dtype=np.int32)
-    col, row = end_col, best_end_row
+    col = best_end_col
 
     while col >= 0:
-        skyline[col] = row
-        if col not in range(width) or row not in cost[col]:
-            break
-        _, prev_col, prev_row = cost[col][row]
-        if prev_col < 0:
-            break
+        skyline[col] = topmost[col]
+        prev_col = parent[col]
 
-        # Fill gaps with linear interpolation
-        if prev_col < col - 1:
+        if prev_col >= 0 and prev_col < col - 1:
+            # Fill gaps with linear interpolation
+            prev_row = topmost[prev_col]
+            curr_row = topmost[col]
             for fill_col in range(prev_col + 1, col):
                 t = (fill_col - prev_col) / (col - prev_col)
-                skyline[fill_col] = int(prev_row + t * (row - prev_row))
+                skyline[fill_col] = int(prev_row + t * (curr_row - prev_row))
 
-        col, row = prev_col, prev_row
+        col = prev_col
 
-    # Fill remaining gaps at start
-    first_valid_idx = -1
-    for i in range(width):
-        if skyline[i] >= 0:
-            first_valid_idx = i
-            break
+    # Fill remaining gaps at start and end
+    first_filled = np.argmax(skyline >= 0)
+    if first_filled > 0:
+        skyline[:first_filled] = skyline[first_filled]
 
-    if first_valid_idx > 0:
-        skyline[:first_valid_idx] = skyline[first_valid_idx]
-
-    # Fill remaining gaps at end
-    if end_col < width - 1:
-        skyline[end_col + 1:] = skyline[end_col]
+    last_filled = width - 1 - np.argmax(skyline[::-1] >= 0)
+    if last_filled < width - 1:
+        skyline[last_filled + 1:] = skyline[last_filled]
 
     return skyline
 
