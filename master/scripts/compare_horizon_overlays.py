@@ -4,7 +4,7 @@
 Overlays:
 - Orange line: Artificial horizon from accelerometer (pitch + roll)
 - Red X: Tannhorn summit projected from DEM coordinates
-- Black line: Mountain outline from DEM projection at Tannhorn's distance
+- Black line: Full horizon from DEM ray-casting (100m-10km)
 - Magenta line: Skyline detected from image using edge detection
 """
 
@@ -327,39 +327,68 @@ def project_point(
 # DEM Horizon Computation
 # =============================================================================
 
-def compute_horizon_at_distance(
+def compute_horizon(
     cam_lat: float, cam_lon: float, cam_alt: float,
     heading: float, pitch: float, fov_h: float, fov_v: float,
     dem_data: np.ndarray, transform: rasterio.Affine,
     transformer: Transformer = None,
-    target_distance: float = 624.0,
-    num_rays: int = 200,
+    num_rays: int = 300,
+    min_distance: float = 100,    # Ignore terrain within 100m
+    max_distance: float = 10000,  # 10km max
+    step_size: float = 30,        # Match DEM resolution
+    extra_fov: float = 20,        # Compute rays this many degrees beyond FOV edges
 ) -> list[tuple[float, float]]:
     """
-    Compute the DEM outline at a specific distance (for comparison with skyline).
-    Returns list of (norm_x, norm_y) points.
+    Compute horizon by finding max elevation angle along each azimuth.
+    Computes rays for fov_h + 2*extra_fov degrees, but only returns points within FOV.
+    Falls back to 0° elevation (artificial horizon) if no terrain found.
     """
     horizon_points = []
 
+    # Compute across extended FOV for clean edges
+    extended_fov = fov_h + 2 * extra_fov
+
     for i in range(num_rays):
-        azimuth = heading - fov_h / 2 + (i / (num_rays - 1)) * fov_h
+        azimuth = heading - extended_fov / 2 + (i / (num_rays - 1)) * extended_fov
 
-        point_lat, point_lon = destination_point(cam_lat, cam_lon, azimuth, target_distance)
+        max_elevation_angle = -90
+        best_point = None
 
-        terrain_alt = get_elevation(dem_data, transform, point_lat, point_lon, transformer)
+        # Ray-cast from min to max distance
+        for distance in range(int(min_distance), int(max_distance), int(step_size)):
+            point_lat, point_lon = destination_point(cam_lat, cam_lon, azimuth, distance)
+            terrain_alt = get_elevation(dem_data, transform, point_lat, point_lon, transformer)
 
-        if terrain_alt is None:
-            continue
+            if terrain_alt is None:
+                continue
 
-        result = project_point(
-            point_lat, point_lon, terrain_alt,
-            cam_lat, cam_lon, cam_alt,
-            heading, pitch,
-            fov_h, fov_v,
-            min_distance=0
-        )
-        if result is not None:
-            horizon_points.append(result)
+            delta_elevation = terrain_alt - cam_alt
+            elevation_angle = math.degrees(math.atan2(delta_elevation, distance))
+
+            if elevation_angle > max_elevation_angle:
+                max_elevation_angle = elevation_angle
+                best_point = (point_lat, point_lon, terrain_alt)
+
+        # Project result (or fall back to artificial horizon)
+        if best_point is not None:
+            result = project_point(
+                best_point[0], best_point[1], best_point[2],
+                cam_lat, cam_lon, cam_alt,
+                heading, pitch, fov_h, fov_v,
+                min_distance=0
+            )
+            if result is not None:
+                horizon_points.append(result)
+        else:
+            # No terrain found - use artificial horizon (0° elevation)
+            relative_bearing = normalize_angle(azimuth - heading)
+            relative_pitch = 0 - pitch  # 0° elevation relative to camera pitch
+            half_fov_h = fov_h / 2
+            half_fov_v = fov_v / 2
+            if abs(relative_bearing) <= half_fov_h:
+                norm_x = relative_bearing / half_fov_h
+                norm_y = -relative_pitch / half_fov_v
+                horizon_points.append((norm_x, norm_y))
 
     return horizon_points
 
@@ -570,32 +599,34 @@ def main():
 
     draw.line([(0, left_py), (width, right_py)], fill=ORANGE, width=6)
 
-    # 3. Draw black DEM outline at peak's distance
-    print(f"Computing DEM outline at {peak_distance:.0f}m (black)...")
-    BLACK = (0, 0, 0)
-    dem_points = compute_horizon_at_distance(
-        pose.lat, pose.lon, pose.alt,
-        pose.heading, pose.pitch,
-        pose.fov_h, pose.fov_v,
-        dem_data, dem_transform,
-        transformer=transformer,
-        target_distance=peak_distance,
-        num_rays=300,
-    )
-
-    if dem_points:
-        dem_pixels = []
-        for norm_x, norm_y in dem_points:
-            px = int(width / 2 + norm_x * width / 2)
-            py = int(height / 2 + norm_y * height / 2)
-            dem_pixels.append((px, py))
-
-        dem_pixels = rdp_simplify(dem_pixels, epsilon=10)
-        print(f"  DEM points: {len(dem_pixels)}")
-
-        if len(dem_pixels) >= 2:
-            for i in range(len(dem_pixels) - 1):
-                draw.line([dem_pixels[i], dem_pixels[i + 1]], fill=BLACK, width=4)
+    # # 3. Draw black DEM horizon (ray-cast across all distances)
+    # print("Computing DEM horizon 100m-10km (black)...")
+    # BLACK = (0, 0, 0)
+    # dem_points = compute_horizon(
+    #     pose.lat, pose.lon, pose.alt,
+    #     pose.heading, pose.pitch,
+    #     pose.fov_h, pose.fov_v,
+    #     dem_data, dem_transform,
+    #     transformer=transformer,
+    #     num_rays=300,
+    #     min_distance=100,
+    #     max_distance=10000,
+    #     extra_fov=20,
+    # )
+    #
+    # if dem_points:
+    #     dem_pixels = []
+    #     for norm_x, norm_y in dem_points:
+    #         px = int(width / 2 + norm_x * width / 2)
+    #         py = int(height / 2 + norm_y * height / 2)
+    #         dem_pixels.append((px, py))
+    #
+    #     dem_pixels = rdp_simplify(dem_pixels, epsilon=10)
+    #     print(f"  DEM points: {len(dem_pixels)}")
+    #
+    #     if len(dem_pixels) >= 2:
+    #         for i in range(len(dem_pixels) - 1):
+    #             draw.line([dem_pixels[i], dem_pixels[i + 1]], fill=BLACK, width=4)
 
     # 4. Draw red X at peak location
     print(f"Drawing peak marker (red) at {peak_lat:.6f}, {peak_lon:.6f}, {peak_elev:.1f}m...")
@@ -627,7 +658,7 @@ def main():
     # Summary
     print("\nOverlay Legend:")
     print("  Orange: Artificial horizon (accelerometer pitch/roll)")
-    print("  Black:  DEM mountain outline at peak distance")
+    print("  Black:  DEM horizon (ray-cast 100m-10km)")
     print("  Red X:  Peak summit location")
     print("  Magenta: Detected skyline from image")
 
