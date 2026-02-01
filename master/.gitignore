@@ -11,3 +11,4 @@ build/
 # Data folders
 img/
 gpx/
+dem/tiles/
