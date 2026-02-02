@@ -12,5 +12,7 @@ build/
 img/
 gpx/
 dem/tiles/
+dem/50cm/
+dem/200cm/
 output/
 tmp/

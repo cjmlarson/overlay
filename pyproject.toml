@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "gpxpy>=1.6.2",
     "matplotlib>=3.10.8",
+    "numba>=0.63.1",
     "numpy>=1.26.0",
     "opencv-python>=4.13.0.90",
     "pillow>=12.1.0",

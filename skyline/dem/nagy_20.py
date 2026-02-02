@@ -561,6 +561,7 @@ def determine_azimuth(
     search_window: float = 45.0,
     apply_tilt: bool = True,
     verbose: bool = False,
+    skyline_method: str = "lie",
 ) -> tuple[float, float, dict]:
     """
     Full pipeline: image → azimuth.
@@ -577,6 +578,7 @@ def determine_azimuth(
         search_window: Search ± this many degrees around compass heading
         apply_tilt: Whether to apply pitch/roll correction
         verbose: Print progress messages
+        skyline_method: Image skyline detection method ("lie" or "nagy")
 
     Returns:
         Tuple of (azimuth, correlation, debug_info):
@@ -584,16 +586,20 @@ def determine_azimuth(
         - correlation: Match quality (0-1)
         - debug_info: Dict with intermediate values for debugging
     """
-    from utils import (
+    from dem.utils import (
         extract_gps_from_image,
         gps_to_swiss,
         load_dem_tiles,
         extract_camera_params,
         apply_tilt_correction,
     )
-    from lie_05 import load_image, detect_skyline
+    if skyline_method == "nagy":
+        from skyline.image.nagy_20 import load_image, detect_skyline
+    else:
+        from skyline.image.lie_05 import load_image, detect_skyline
 
     debug = {}
+    debug["skyline_method"] = skyline_method
 
     # 1. Extract camera parameters from EXIF
     if verbose:
