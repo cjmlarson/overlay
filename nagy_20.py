@@ -236,6 +236,8 @@ if __name__ == "__main__":
     parser.add_argument("image", help="Path to geotagged image")
     parser.add_argument("--dem-dir", default="dem", help="Directory containing DEM tiles")
     parser.add_argument("--radius", type=float, default=10000, help="Radius in meters (default: 10000)")
+    parser.add_argument("--dem-resolution", choices=["50cm", "200cm"], default="200cm",
+                        help="DEM resolution (default: 200cm for faster processing)")
     parser.add_argument("--height", type=float, default=2.0, help="Camera height above ground (default: 2.0)")
     parser.add_argument("--output", help="Output file for skyline plot (PNG)")
     parser.add_argument("--resolution", type=float, default=0.1, help="Azimuth resolution in degrees (default: 0.1)")
@@ -253,8 +255,8 @@ if __name__ == "__main__":
     print(f"Swiss coords: {cam_e:.1f} E, {cam_n:.1f} N")
 
     # Load DEM tiles
-    print(f"Loading DEM tiles within {args.radius/1000:.1f}km radius...")
-    grid, transform = load_dem_tiles(args.dem_dir, cam_e, cam_n, radius=args.radius)
+    print(f"Loading DEM tiles within {args.radius/1000:.1f}km radius ({args.dem_resolution} resolution)...")
+    grid, transform = load_dem_tiles(args.dem_dir, cam_e, cam_n, radius=args.radius, resolution=args.dem_resolution)
     print(f"DEM grid size: {grid.shape} ({grid.shape[0] * grid.shape[1] / 1e6:.1f}M points)")
 
     # Get camera elevation
