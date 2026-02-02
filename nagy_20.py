@@ -694,6 +694,48 @@ Position:
             plt.savefig(args.output, dpi=150)
             print(f"Saved debug plot to {args.output}")
 
+        # Save CSV results
+        if args.csv:
+            import csv
+            from pathlib import Path
+
+            csv_path = Path(args.csv)
+            file_exists = csv_path.exists()
+
+            # Compute difference from compass
+            compass = debug["camera_params"]["compass_heading"]
+            if compass is not None:
+                diff = azimuth - compass
+                if diff > 180:
+                    diff -= 360
+                elif diff < -180:
+                    diff += 360
+            else:
+                diff = None
+
+            row = {
+                "image": args.image,
+                "computed_azimuth": f"{azimuth:.2f}",
+                "compass_heading": f"{compass:.2f}" if compass else "",
+                "difference": f"{diff:.2f}" if diff is not None else "",
+                "correlation": f"{correlation:.3f}",
+                "fov_h": f"{debug['camera_params']['fov_h']:.1f}",
+                "fov_v": f"{debug['fov_v']:.1f}",
+                "pitch": f"{debug['camera_params']['pitch']:.1f}" if debug['camera_params']['pitch'] else "",
+                "roll": f"{debug['camera_params']['roll']:.1f}" if debug['camera_params']['roll'] else "",
+                "lat": f"{debug['position']['lat']:.6f}",
+                "lon": f"{debug['position']['lon']:.6f}",
+                "elevation": f"{debug['camera_elevation']:.1f}",
+            }
+
+            with open(csv_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=row.keys())
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(row)
+
+            print(f"Saved results to {args.csv}")
+
         exit(0)
 
     # Get camera position from image
