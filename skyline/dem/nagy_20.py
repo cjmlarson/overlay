@@ -65,7 +65,7 @@ def get_camera_elevation(
     Raises:
         ValueError: If camera position is outside DEM coverage
     """
-    from utils import sample_elevation
+    from dem.utils import sample_elevation
 
     ground_z = sample_elevation(grid, transform, cam_e, cam_n)
     if np.isnan(ground_z):
@@ -230,7 +230,7 @@ def plot_skyline(skyline: np.ndarray, azimuth_resolution: float = 0.1, ax=None):
 if __name__ == "__main__":
     # Example usage with test location
     import argparse
-    from utils import extract_gps_from_image, gps_to_swiss, load_dem_tiles
+    from dem.utils import extract_gps_from_image, gps_to_swiss, load_dem_tiles
 
     parser = argparse.ArgumentParser(description="Generate panoramic skyline from DEM")
     parser.add_argument("image", help="Path to geotagged image")
