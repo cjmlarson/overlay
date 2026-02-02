@@ -562,6 +562,8 @@ def determine_azimuth(
     apply_tilt: bool = True,
     verbose: bool = False,
     skyline_method: str = "lie",
+    optimize_orientation: bool = False,
+    roll_range: float = 5.0,
 ) -> tuple[float, float, dict]:
     """
     Full pipeline: image → azimuth.
@@ -579,6 +581,9 @@ def determine_azimuth(
         apply_tilt: Whether to apply pitch/roll correction
         verbose: Print progress messages
         skyline_method: Image skyline detection method ("lie" or "nagy")
+        optimize_orientation: If True, optimize roll (Brent's method) and
+            pitch (closed-form) after azimuth matching
+        roll_range: Search ± this many degrees for roll optimization (default 5.0)
 
     Returns:
         Tuple of (azimuth, correlation, debug_info):
@@ -750,6 +755,64 @@ def determine_azimuth(
         search_window=search_window,
     )
     debug["correlation_curve"] = corr_curve
+
+    # 9. Orientation optimization (optional)
+    if optimize_orientation and params["roll"] is not None:
+        from skyline.dem.optimize import optimize_roll, compute_optimal_pitch
+
+        if verbose:
+            print(f"\nOptimizing orientation at fixed azimuth {azimuth:.1f}°...")
+            print(f"  Initial roll: {params['roll']:.2f}°, pitch: {params['pitch']:.2f}°")
+
+        # Optimize roll using Brent's method
+        optimal_roll, roll_corr = optimize_roll(
+            dem_skyline,  # Use original (uncorrected) skyline
+            image_skyline_resampled,
+            azimuth,
+            params["compass_heading"] or 0,
+            params["pitch"],
+            params["roll"],
+            roll_range,
+            azimuth_resolution,
+        )
+
+        if verbose:
+            print(f"  Optimal roll: {optimal_roll:.2f}° (Δ={optimal_roll - params['roll']:+.2f}°)")
+            print(f"  Correlation: {correlation:.4f} → {roll_corr:.4f}")
+
+        # Re-apply tilt correction with optimized roll for pitch computation
+        azimuths = np.arange(len(dem_skyline)) * azimuth_resolution
+        dem_skyline_opt = apply_tilt_correction(
+            dem_skyline, azimuths, params["compass_heading"] or 0,
+            params["pitch"], optimal_roll
+        )
+
+        # Compute optimal pitch for visual alignment
+        pitch_offset = compute_optimal_pitch(
+            dem_skyline_opt,
+            image_skyline_resampled,
+            azimuth,
+            azimuth_resolution,
+        )
+        optimal_pitch = params["pitch"] + pitch_offset
+
+        if verbose:
+            print(f"  Optimal pitch: {optimal_pitch:.2f}° (Δ={pitch_offset:+.2f}°)")
+
+        # Store optimization results in debug dict
+        debug["roll_init"] = params["roll"]
+        debug["roll_optimized"] = optimal_roll
+        debug["pitch_init"] = params["pitch"]
+        debug["pitch_optimized"] = optimal_pitch
+        debug["pitch_offset"] = pitch_offset
+        debug["correlation_before_roll"] = correlation
+        debug["correlation_after_roll"] = roll_corr
+
+        # Update correlation to reflect roll optimization
+        correlation = roll_corr
+
+        # Update the corrected skyline for any downstream use
+        debug["dem_skyline_corrected"] = dem_skyline_opt
 
     if verbose:
         print(f"\nResult:")
