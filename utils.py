@@ -15,6 +15,8 @@ from pathlib import Path
 import exiftool
 import numpy as np
 import rasterio
+from PIL import Image
+from PIL.ImageOps import exif_transpose
 from rasterio.merge import merge
 from pyproj import Transformer
 from tqdm import tqdm
@@ -56,6 +58,139 @@ def extract_gps_from_image(image_path: str) -> tuple[float, float]:
         return lat, lon
 
     raise ValueError(f"No GPS data found in {image_path}")
+
+
+def extract_camera_params(image_path: str) -> dict:
+    """
+    Extract camera parameters from EXIF metadata.
+
+    Returns dict with:
+        - fov_h: horizontal FOV in degrees (None if not available)
+        - compass_heading: GPSImgDirection in degrees from true north (None if not available)
+        - pitch: camera pitch in degrees (+ = looking up, None if not available)
+        - roll: camera roll in degrees (+ = right side down, None if not available)
+        - image_width: width in pixels after EXIF orientation applied
+        - image_height: height in pixels after EXIF orientation applied
+    """
+    with exiftool.ExifToolHelper() as et:
+        metadata = et.get_metadata(image_path)[0]
+
+    # Get FOV (iPhone stores this as "Field Of View" or in Composite tags)
+    fov_h = None
+    for key in ["Composite:FOV", "EXIF:FieldOfView", "MakerNotes:FieldOfView"]:
+        if key in metadata:
+            # Parse "73.7 deg" format
+            val = metadata[key]
+            if isinstance(val, str):
+                fov_h = float(val.split()[0])
+            else:
+                fov_h = float(val)
+            break
+
+    # Compass heading (GPSImgDirection)
+    compass_heading = None
+    if "EXIF:GPSImgDirection" in metadata:
+        compass_heading = float(metadata["EXIF:GPSImgDirection"])
+    elif "Composite:GPSImgDirection" in metadata:
+        compass_heading = float(metadata["Composite:GPSImgDirection"])
+
+    # Pitch and roll from AccelerationVector
+    # iPhone AccelerationVector is gravity in device coords: (ax, ay, az)
+    # Device coords: x=right, y=up, z=toward user (out of screen)
+    # When level and upright: gravity = (0, -1, 0)
+    pitch, roll = None, None
+    accel_str = metadata.get("MakerNotes:AccelerationVector")
+    if accel_str:
+        ax, ay, az = map(float, accel_str.split())
+
+        # Get EXIF orientation to understand coordinate mapping
+        # EXIF orientation values: 1=normal, 6=Rotate 90 CW, 8=Rotate 90 CCW
+        orientation = metadata.get("EXIF:Orientation", 1)
+
+        # For orientation 6 (Rotate 90 CW): phone was portrait, image rotated for display
+        # Camera looks along -z axis in device coords
+        # Pitch: az < 0 means phone top tilted forward → camera pointing DOWN → negative pitch
+        # Pitch: az > 0 means phone top tilted back → camera pointing UP → positive pitch
+        if orientation == 6 or "Rotate 90 CW" in str(orientation):
+            # pitch = asin(az) but use atan2 for robustness
+            pitch = math.degrees(math.atan2(az, -ay))
+            # Roll: rotation around viewing axis
+            roll = math.degrees(math.atan2(ax, -ay))
+        elif orientation == 8 or "Rotate 90 CCW" in str(orientation):
+            pitch = math.degrees(math.atan2(az, ay))
+            roll = math.degrees(math.atan2(-ax, ay))
+        else:
+            # Normal orientation (phone landscape)
+            pitch = math.degrees(math.atan2(az, -ay))
+            roll = math.degrees(math.atan2(ax, -ay))
+
+    # Get image dimensions after EXIF orientation is applied
+    img = Image.open(image_path)
+    orig_width, orig_height = img.size  # Before rotation
+    img = exif_transpose(img)
+    image_width, image_height = img.size  # After rotation
+    img.close()
+
+    # Adjust FOV for orientation
+    # EXIF FOV is typically for the sensor's horizontal (longer) dimension
+    # For rotated portrait images, we need to compute the post-rotation HFOV
+    # EXIF orientation values: 6 = Rotate 90 CW, 8 = Rotate 90 CCW
+    orientation = metadata.get("EXIF:Orientation", 1)
+    is_rotated_90 = orientation in [6, 8] or "Rotate 90" in str(orientation)
+    if fov_h is not None and is_rotated_90:
+        # Image was rotated 90°, so sensor horizontal → image vertical
+        # Compute the sensor VFOV, which is now the image HFOV
+        sensor_aspect = orig_width / orig_height  # Original sensor aspect
+        fov_h = fov_h / sensor_aspect  # Sensor VFOV, now image HFOV
+
+    return {
+        "fov_h": fov_h,
+        "compass_heading": compass_heading,
+        "pitch": pitch,
+        "roll": roll,
+        "image_width": image_width,
+        "image_height": image_height,
+    }
+
+
+def apply_tilt_correction(
+    elevations: np.ndarray,
+    azimuths: np.ndarray,
+    center_azimuth: float,
+    pitch: float,
+    roll: float,
+) -> np.ndarray:
+    """
+    Apply camera tilt correction to DEM skyline elevations.
+
+    This adjusts elevation angles to account for camera pitch and roll,
+    so the DEM skyline matches what the camera actually sees.
+
+    NOT from Nagy paper - he notes cross-correlation is "insensitive to
+    slight slant". This is an extension for better accuracy.
+
+    Args:
+        elevations: elevation angles in degrees
+        azimuths: azimuth angles in degrees corresponding to each elevation
+        center_azimuth: azimuth that camera is pointing at (image center)
+        pitch: camera pitch in degrees (+ = looking up)
+        roll: camera roll in degrees (+ = right side down)
+
+    Returns:
+        Corrected elevation angles in degrees
+    """
+    # Pitch: uniform offset. If camera looks up by P degrees,
+    # the horizon appears P degrees lower in the image.
+    corrected = elevations - pitch
+
+    # Roll: varies with horizontal angle from center.
+    # At angle θ from center, shift = roll * sin(θ)
+    # Positive roll (right side down) shifts left side up, right side down
+    angle_from_center = np.radians(azimuths - center_azimuth)
+    roll_correction = roll * np.sin(angle_from_center)
+    corrected = corrected - roll_correction
+
+    return corrected
 
 
 def gps_to_swiss(lat: float, lon: float) -> tuple[float, float]:

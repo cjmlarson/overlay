@@ -230,12 +230,361 @@ def plot_skyline(skyline: np.ndarray, azimuth_resolution: float = 0.1, ax=None):
     return ax
 
 
+# --- Skyline Matching (Nagy 2020 §3.3) ---
+
+
+def skyline_to_elevation(
+    skyline_rows: np.ndarray,
+    image_height: int,
+    fov_v: float,
+) -> np.ndarray:
+    """
+    Convert image skyline (pixel rows) to elevation angles.
+
+    Assumes image center corresponds to 0° elevation (horizontal).
+
+    Args:
+        skyline_rows: Row indices from lie_05.dp_skyline() (-1 = invalid)
+        image_height: Image height in pixels
+        fov_v: Vertical field of view in degrees
+
+    Returns:
+        Elevation angles in degrees (NaN for invalid rows)
+    """
+    # Image center is assumed to be horizon (0° elevation)
+    center_row = image_height / 2
+    degrees_per_pixel = fov_v / image_height
+
+    # Row 0 is top of image (positive elevation), row max is bottom (negative)
+    elevations = (center_row - skyline_rows) * degrees_per_pixel
+
+    # Mark invalid rows as NaN
+    elevations = np.where(skyline_rows >= 0, elevations, np.nan)
+
+    return elevations
+
+
+def resample_skyline(
+    skyline: np.ndarray,
+    source_fov: float,
+    target_resolution: float,
+) -> np.ndarray:
+    """
+    Resample image skyline to match DEM panoramic skyline resolution.
+
+    Nagy §3.3: "HFOV of the camera and the panoramic skyline need to be
+    synchronized via the sampling rate of the two signals."
+
+    Args:
+        skyline: Image skyline elevation angles (one per column)
+        source_fov: Horizontal FOV of the image in degrees
+        target_resolution: Target angular resolution in degrees per sample
+
+    Returns:
+        Resampled skyline with target_resolution spacing
+    """
+    num_source = len(skyline)
+    source_resolution = source_fov / num_source
+
+    # Number of output samples
+    num_target = int(np.ceil(source_fov / target_resolution))
+
+    # Create output positions
+    target_positions = np.arange(num_target) * target_resolution / source_resolution
+
+    # Interpolate (use linear interpolation, handling NaN)
+    valid_mask = ~np.isnan(skyline)
+    if not valid_mask.any():
+        return np.full(num_target, np.nan)
+
+    # Simple linear interpolation
+    source_positions = np.arange(num_source)
+    resampled = np.interp(
+        target_positions,
+        source_positions[valid_mask],
+        skyline[valid_mask],
+        left=np.nan,
+        right=np.nan,
+    )
+
+    return resampled
+
+
+def match_skylines(
+    dem_skyline: np.ndarray,
+    image_skyline: np.ndarray,
+    image_fov: float,
+    azimuth_resolution: float = 0.1,
+    search_center: float | None = None,
+    search_window: float = 180.0,
+) -> tuple[float, float, np.ndarray]:
+    """
+    Find best alignment via normalized cross-correlation.
+
+    Nagy §3.3: "After calculating the cross-correlation between the two
+    vectors, the maximum of the cross-correlation function indicates the
+    point K where the signals are best aligned."
+
+    Args:
+        dem_skyline: Full 360° panoramic skyline from compute_panoramic_skyline
+        image_skyline: Resampled image skyline (elevation angles, may have NaN)
+        image_fov: Horizontal FOV of the image in degrees
+        azimuth_resolution: Angular resolution of DEM skyline
+        search_center: Center azimuth for search (None = search full 360°)
+        search_window: Search ± this many degrees around center
+
+    Returns:
+        Tuple of (best_azimuth, correlation, correlation_curve):
+        - best_azimuth: Azimuth of image center in degrees
+        - correlation: Peak correlation value (0-1)
+        - correlation_curve: Full correlation curve for diagnostics
+    """
+    num_dem = len(dem_skyline)
+    num_image = len(image_skyline)
+
+    # Determine search range
+    if search_center is not None:
+        # Search around specified center
+        start_idx = int((search_center - search_window) / azimuth_resolution) % num_dem
+        end_idx = int((search_center + search_window) / azimuth_resolution) % num_dem
+        if start_idx < end_idx:
+            search_indices = np.arange(start_idx, end_idx)
+        else:
+            # Wrap around 0°
+            search_indices = np.concatenate([
+                np.arange(start_idx, num_dem),
+                np.arange(0, end_idx)
+            ])
+    else:
+        search_indices = np.arange(num_dem)
+
+    # Create mask for valid image samples
+    valid_mask = ~np.isnan(image_skyline)
+    if valid_mask.sum() < 10:
+        raise ValueError("Too few valid image skyline samples for matching")
+
+    # Normalize image skyline (zero mean, unit variance) for NCC
+    image_valid = image_skyline[valid_mask]
+    image_mean = np.mean(image_valid)
+    image_std = np.std(image_valid)
+    if image_std < 1e-6:
+        raise ValueError("Image skyline has no variation")
+    image_norm = (image_skyline - image_mean) / image_std
+    image_norm = np.where(valid_mask, image_norm, 0)
+
+    # Compute normalized cross-correlation at each position
+    correlations = np.zeros(num_dem)
+    half_width = num_image // 2
+
+    for shift in search_indices:
+        # Extract DEM window centered at this position
+        # The shift represents where the image center would be
+        start = (shift - half_width) % num_dem
+        indices = [(start + i) % num_dem for i in range(num_image)]
+        dem_window = dem_skyline[indices]
+
+        # Normalize DEM window
+        dem_valid = dem_window[valid_mask]
+        dem_mean = np.mean(dem_valid)
+        dem_std = np.std(dem_valid)
+        if dem_std < 1e-6:
+            continue
+        dem_norm = (dem_window - dem_mean) / dem_std
+
+        # Compute correlation only at valid positions
+        corr = np.sum(image_norm[valid_mask] * dem_norm[valid_mask]) / valid_mask.sum()
+        correlations[shift] = corr
+
+    # Find best match
+    best_idx = np.argmax(correlations)
+    best_azimuth = best_idx * azimuth_resolution
+    best_corr = correlations[best_idx]
+
+    return best_azimuth, best_corr, correlations
+
+
+def determine_azimuth(
+    image_path: str,
+    dem_dir: str = "dem",
+    dem_resolution: str = "200cm",
+    dem_radius: float = 10000,
+    azimuth_resolution: float = 0.1,
+    search_window: float = 45.0,
+    apply_tilt: bool = True,
+    verbose: bool = False,
+) -> tuple[float, float, dict]:
+    """
+    Full pipeline: image → azimuth.
+
+    Implements Nagy 2020 method: extract skyline from image, compute
+    panoramic skyline from DEM, match via cross-correlation.
+
+    Args:
+        image_path: Path to geotagged image
+        dem_dir: Directory containing DEM tiles
+        dem_resolution: DEM resolution ("50cm" or "200cm")
+        dem_radius: Radius in meters for DEM loading
+        azimuth_resolution: Angular resolution in degrees
+        search_window: Search ± this many degrees around compass heading
+        apply_tilt: Whether to apply pitch/roll correction
+        verbose: Print progress messages
+
+    Returns:
+        Tuple of (azimuth, correlation, debug_info):
+        - azimuth: Computed azimuth of image center (degrees from true north)
+        - correlation: Match quality (0-1)
+        - debug_info: Dict with intermediate values for debugging
+    """
+    from utils import (
+        extract_gps_from_image,
+        gps_to_swiss,
+        load_dem_tiles,
+        extract_camera_params,
+        apply_tilt_correction,
+    )
+    from lie_05 import load_image, detect_skyline
+
+    debug = {}
+
+    # 1. Extract camera parameters from EXIF
+    if verbose:
+        print(f"Reading EXIF from {image_path}...")
+    params = extract_camera_params(image_path)
+    debug["camera_params"] = params
+
+    if params["fov_h"] is None:
+        raise ValueError("No FOV found in EXIF data")
+
+    # Compute vertical FOV from horizontal FOV and aspect ratio
+    aspect = params["image_width"] / params["image_height"]
+    fov_v = params["fov_h"] / aspect
+    debug["fov_v"] = fov_v
+
+    if verbose:
+        print(f"  FOV: {params['fov_h']:.1f}° H × {fov_v:.1f}° V")
+        print(f"  Compass heading: {params['compass_heading']:.1f}°")
+        if params["pitch"] is not None:
+            print(f"  Tilt: pitch={params['pitch']:.1f}°, roll={params['roll']:.1f}°")
+
+    # 2. Get camera position
+    lat, lon = extract_gps_from_image(image_path)
+    cam_e, cam_n = gps_to_swiss(lat, lon)
+    debug["position"] = {"lat": lat, "lon": lon, "easting": cam_e, "northing": cam_n}
+
+    if verbose:
+        print(f"Camera position: {lat:.6f}°N, {lon:.6f}°E")
+        print(f"  Swiss coords: {cam_e:.1f} E, {cam_n:.1f} N")
+
+    # 3. Load DEM and compute panoramic skyline
+    if verbose:
+        print(f"Loading DEM tiles ({dem_resolution}, {dem_radius/1000:.0f}km radius)...")
+    grid, transform = load_dem_tiles(dem_dir, cam_e, cam_n, radius=dem_radius, resolution=dem_resolution)
+
+    cam_z = get_camera_elevation(grid, transform, cam_e, cam_n)
+    debug["camera_elevation"] = cam_z
+
+    if verbose:
+        print(f"Computing panoramic skyline...")
+    dem_skyline = compute_panoramic_skyline(
+        grid, transform, cam_e, cam_n, cam_z,
+        azimuth_resolution=azimuth_resolution,
+        max_distance=dem_radius,
+    )
+    debug["dem_skyline"] = dem_skyline
+
+    if verbose:
+        print(f"  DEM skyline: {len(dem_skyline)} samples, range [{dem_skyline.min():.1f}°, {dem_skyline.max():.1f}°]")
+
+    # 4. Extract image skyline
+    if verbose:
+        print("Extracting image skyline...")
+    image = load_image(image_path)
+    skyline_rows, scale = detect_skyline(image)
+    debug["image_skyline_rows"] = skyline_rows
+    debug["image_scale"] = scale
+
+    # Scale rows back to original image size
+    skyline_rows_orig = (skyline_rows / scale).astype(int)
+    skyline_rows_orig = np.where(skyline_rows >= 0, skyline_rows_orig, -1)
+
+    valid_count = np.sum(skyline_rows >= 0)
+    if verbose:
+        print(f"  Image skyline: {valid_count}/{len(skyline_rows)} valid columns")
+
+    # 5. Convert to elevation angles
+    image_elevations = skyline_to_elevation(
+        skyline_rows_orig,
+        params["image_height"],
+        fov_v,
+    )
+    debug["image_elevations"] = image_elevations
+
+    # 6. Apply tilt correction to DEM skyline (if enabled)
+    if apply_tilt and params["pitch"] is not None:
+        if verbose:
+            print(f"Applying tilt correction (pitch={params['pitch']:.1f}°, roll={params['roll']:.1f}°)...")
+        azimuths = np.arange(len(dem_skyline)) * azimuth_resolution
+        dem_skyline_corrected = apply_tilt_correction(
+            dem_skyline,
+            azimuths,
+            params["compass_heading"] or 0,
+            params["pitch"],
+            params["roll"],
+        )
+        debug["dem_skyline_corrected"] = dem_skyline_corrected
+    else:
+        dem_skyline_corrected = dem_skyline
+
+    # 7. Resample image skyline to match DEM resolution
+    image_skyline_resampled = resample_skyline(
+        image_elevations,
+        params["fov_h"],
+        azimuth_resolution,
+    )
+    debug["image_skyline_resampled"] = image_skyline_resampled
+
+    if verbose:
+        print(f"  Resampled image skyline: {len(image_skyline_resampled)} samples")
+
+    # 8. Match skylines
+    if verbose:
+        search_center = params["compass_heading"]
+        if search_center is not None:
+            print(f"Matching skylines (searching ±{search_window}° around {search_center:.1f}°)...")
+        else:
+            print(f"Matching skylines (searching full 360°)...")
+
+    azimuth, correlation, corr_curve = match_skylines(
+        dem_skyline_corrected,
+        image_skyline_resampled,
+        params["fov_h"],
+        azimuth_resolution=azimuth_resolution,
+        search_center=params["compass_heading"],
+        search_window=search_window,
+    )
+    debug["correlation_curve"] = corr_curve
+
+    if verbose:
+        print(f"\nResult:")
+        print(f"  Computed azimuth: {azimuth:.2f}°")
+        print(f"  Correlation: {correlation:.3f}")
+        if params["compass_heading"] is not None:
+            diff = azimuth - params["compass_heading"]
+            if diff > 180:
+                diff -= 360
+            elif diff < -180:
+                diff += 360
+            print(f"  Difference from compass: {diff:+.2f}°")
+
+    return azimuth, correlation, debug
+
+
 if __name__ == "__main__":
     # Example usage with test location
     import argparse
     from utils import extract_gps_from_image, gps_to_swiss, load_dem_tiles
 
-    parser = argparse.ArgumentParser(description="Generate panoramic skyline from DEM")
+    parser = argparse.ArgumentParser(description="Generate panoramic skyline from DEM and match with image")
     parser.add_argument("image", help="Path to geotagged image")
     parser.add_argument("--dem-dir", default="dem", help="Directory containing DEM tiles")
     parser.add_argument("--radius", type=float, default=10000, help="Radius in meters (default: 10000)")
@@ -247,7 +596,105 @@ if __name__ == "__main__":
     parser.add_argument("--csv", help="Output CSV file for skyline data")
     parser.add_argument("--with-distances", action="store_true", help="Include distance data in output")
 
+    # Matching options
+    parser.add_argument("--match", action="store_true", help="Run full azimuth matching pipeline")
+    parser.add_argument("--search-window", type=float, default=45.0, help="Search window ± degrees around compass (default: 45)")
+    parser.add_argument("--no-tilt", action="store_true", help="Disable pitch/roll tilt correction")
+
     args = parser.parse_args()
+
+    # If --match is specified, run the full pipeline
+    if args.match:
+        azimuth, correlation, debug = determine_azimuth(
+            args.image,
+            dem_dir=args.dem_dir,
+            dem_resolution=args.dem_resolution,
+            dem_radius=args.radius,
+            azimuth_resolution=args.resolution,
+            search_window=args.search_window,
+            apply_tilt=not args.no_tilt,
+            verbose=True,
+        )
+
+        # Optionally save debug plot
+        if args.output:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+            # 1. DEM skyline (polar)
+            ax_polar = fig.add_subplot(2, 2, 1, projection='polar')
+            plot_skyline(debug["dem_skyline"], args.resolution, ax_polar)
+            ax_polar.set_title("DEM Panoramic Skyline")
+
+            # 2. Correlation curve
+            ax_corr = axes[0, 1]
+            corr = debug["correlation_curve"]
+            azimuths_full = np.arange(len(corr)) * args.resolution
+            ax_corr.plot(azimuths_full, corr, 'b-', linewidth=0.5)
+            ax_corr.axvline(azimuth, color='r', linestyle='--', label=f'Best: {azimuth:.1f}°')
+            compass = debug["camera_params"]["compass_heading"]
+            if compass is not None:
+                ax_corr.axvline(compass, color='g', linestyle=':', label=f'Compass: {compass:.1f}°')
+            ax_corr.set_xlabel('Azimuth (degrees)')
+            ax_corr.set_ylabel('Correlation')
+            ax_corr.set_xlim(0, 360)
+            ax_corr.legend()
+            ax_corr.set_title(f'Cross-correlation (peak={correlation:.3f})')
+            ax_corr.grid(True, alpha=0.3)
+
+            # 3. Matched skylines overlay
+            ax_match = axes[1, 0]
+            dem_sky = debug.get("dem_skyline_corrected", debug["dem_skyline"])
+            img_sky = debug["image_skyline_resampled"]
+            fov_h = debug["camera_params"]["fov_h"]
+            num_img = len(img_sky)
+
+            # Extract DEM window at best match position
+            center_idx = int(azimuth / args.resolution)
+            half_width = num_img // 2
+            start = (center_idx - half_width) % len(dem_sky)
+            indices = [(start + i) % len(dem_sky) for i in range(num_img)]
+            dem_window = dem_sky[indices]
+
+            x = np.linspace(-fov_h/2, fov_h/2, num_img)
+            ax_match.plot(x, dem_window, 'b-', label='DEM skyline', linewidth=1)
+            ax_match.plot(x, img_sky, 'r-', label='Image skyline', linewidth=1)
+            ax_match.set_xlabel('Angle from center (degrees)')
+            ax_match.set_ylabel('Elevation (degrees)')
+            ax_match.legend()
+            ax_match.set_title(f'Matched Skylines (azimuth={azimuth:.1f}°)')
+            ax_match.grid(True, alpha=0.3)
+
+            # 4. Info text
+            ax_info = axes[1, 1]
+            ax_info.axis('off')
+            info_text = f"""
+Azimuth Determination Result
+============================
+Computed azimuth: {azimuth:.2f}°
+Correlation: {correlation:.3f}
+
+Camera Parameters:
+  FOV: {debug["camera_params"]["fov_h"]:.1f}° H × {debug["fov_v"]:.1f}° V
+  Compass heading: {debug["camera_params"]["compass_heading"]:.1f}°
+  Pitch: {debug["camera_params"]["pitch"]:.1f}°
+  Roll: {debug["camera_params"]["roll"]:.1f}°
+
+Position:
+  {debug["position"]["lat"]:.6f}°N, {debug["position"]["lon"]:.6f}°E
+  Elevation: {debug["camera_elevation"]:.1f}m
+"""
+            ax_info.text(0.1, 0.9, info_text, transform=ax_info.transAxes,
+                        fontfamily='monospace', verticalalignment='top', fontsize=10)
+
+            plt.tight_layout()
+            plt.savefig(args.output, dpi=150)
+            print(f"Saved debug plot to {args.output}")
+
+        exit(0)
 
     # Get camera position from image
     print(f"Reading GPS from {args.image}...")
