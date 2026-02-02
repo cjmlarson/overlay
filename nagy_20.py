@@ -166,6 +166,9 @@ def compute_panoramic_skyline(
     # Fast path: use np.maximum.at for efficient scatter-reduce O(n)
     np.maximum.at(skyline, bins, theta_valid)
 
+    # Clip negative values to 0 (horizon extends beyond DEM coverage)
+    skyline = np.maximum(skyline, 0)
+
     if not return_distances:
         return skyline.astype(np.float32)
 
