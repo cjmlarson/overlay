@@ -10,6 +10,7 @@ import argparse
 import math
 import re
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import exiftool
@@ -204,12 +205,47 @@ def gps_to_swiss(lat: float, lon: float) -> tuple[float, float]:
     return easting, northing
 
 
-def tiles_in_radius(center_e: float, center_n: float, radius_km: float = 10) -> set[tuple[int, int]]:
+def _normalize_angle(angle: float) -> float:
+    """Normalize angle to [0, 360) range."""
+    return angle % 360
+
+
+def _angle_in_wedge(angle: float, center: float, half_width: float) -> bool:
+    """Check if angle is within wedge [center - half_width, center + half_width]."""
+    angle = _normalize_angle(angle)
+    center = _normalize_angle(center)
+
+    # Handle wrap-around
+    diff = angle - center
+    if diff > 180:
+        diff -= 360
+    elif diff < -180:
+        diff += 360
+
+    return abs(diff) <= half_width
+
+
+def tiles_in_radius(
+    center_e: float,
+    center_n: float,
+    radius_km: float = 10,
+    azimuth_center: float | None = None,
+    azimuth_window: float | None = None,
+) -> set[tuple[int, int]]:
     """
     Find all 1km tile coordinates within radius_km of center point.
 
+    Optionally filter to only tiles intersecting an azimuth wedge.
+
     Swiss tiles are 1km x 1km, named by their SW corner in km.
     Returns set of (tile_x, tile_y) tuples representing km coordinates.
+
+    Args:
+        center_e: Camera easting (Swiss coords, meters)
+        center_n: Camera northing (Swiss coords, meters)
+        radius_km: Radius in km
+        azimuth_center: Center azimuth in degrees (None = full 360°)
+        azimuth_window: Half-width of wedge in degrees (search ± this amount)
     """
     radius_m = radius_km * 1000
 
@@ -225,6 +261,15 @@ def tiles_in_radius(center_e: float, center_n: float, radius_km: float = 10) -> 
     min_tile_y = int(min_n // 1000)
     max_tile_y = int(max_n // 1000)
 
+    # If wedge filtering is enabled, expand window by half the image FOV
+    # to ensure we have enough DEM data for matching
+    use_wedge = azimuth_center is not None and azimuth_window is not None
+    if use_wedge:
+        # Add buffer for tile size at edge of radius (worst case: tile diagonal)
+        # A 1km tile at 10km distance subtends ~5.7° (atan(1.414/10) ≈ 8°)
+        tile_angle_buffer = 10.0  # degrees
+        half_width = azimuth_window + tile_angle_buffer
+
     tiles = set()
     for tx in range(min_tile_x, max_tile_x + 1):
         for ty in range(min_tile_y, max_tile_y + 1):
@@ -235,8 +280,49 @@ def tiles_in_radius(center_e: float, center_n: float, radius_km: float = 10) -> 
             # Distance from camera to tile center
             dist = math.sqrt((tile_center_e - center_e) ** 2 + (tile_center_n - center_n) ** 2)
 
-            if dist <= radius_m:
-                tiles.add((tx, ty))
+            if dist > radius_m:
+                continue
+
+            # Wedge filtering: check if any tile corner is in the wedge
+            if use_wedge:
+                # Compute azimuth to tile center
+                # Azimuth: North = 0°, East = 90°
+                de = tile_center_e - center_e
+                dn = tile_center_n - center_n
+                center_azimuth = math.degrees(math.atan2(de, dn))
+
+                # Check tile corners (SW, SE, NE, NW)
+                corners = [
+                    (tx * 1000, ty * 1000),          # SW
+                    ((tx + 1) * 1000, ty * 1000),    # SE
+                    ((tx + 1) * 1000, (ty + 1) * 1000),  # NE
+                    (tx * 1000, (ty + 1) * 1000),    # NW
+                ]
+
+                in_wedge = False
+                for corner_e, corner_n in corners:
+                    de = corner_e - center_e
+                    dn = corner_n - center_n
+                    corner_az = math.degrees(math.atan2(de, dn))
+                    if _angle_in_wedge(corner_az, azimuth_center, half_width):
+                        in_wedge = True
+                        break
+
+                # Also check if camera is inside tile (always include)
+                if not in_wedge:
+                    if (tx * 1000 <= center_e < (tx + 1) * 1000 and
+                        ty * 1000 <= center_n < (ty + 1) * 1000):
+                        in_wedge = True
+
+                # Also check tile center
+                if not in_wedge:
+                    if _angle_in_wedge(center_azimuth, azimuth_center, half_width):
+                        in_wedge = True
+
+                if not in_wedge:
+                    continue
+
+            tiles.add((tx, ty))
 
     return tiles
 
@@ -300,6 +386,8 @@ def load_dem_tiles(
     center_n: float,
     radius: float = 10000,
     resolution: str = "200cm",
+    azimuth_center: float | None = None,
+    azimuth_window: float | None = None,
 ) -> tuple[np.ndarray, rasterio.Affine]:
     """
     Load and merge DEM tiles within radius of center point.
@@ -312,6 +400,8 @@ def load_dem_tiles(
         resolution: DEM resolution to use ("50cm" or "200cm", default "200cm")
                     Tiles are stored in {tile_dir}/{resolution}/ subfolders.
                     50cm tiles are downsampled 4x to match 200cm effective resolution.
+        azimuth_center: Center azimuth for wedge filtering (None = full circle)
+        azimuth_window: Half-width of wedge in degrees (search ± this amount)
 
     Returns:
         Tuple of (elevation_grid, transform):
@@ -325,8 +415,12 @@ def load_dem_tiles(
     # 200cm tiles are already at 2m, no downsampling needed
     downsample = 4 if resolution == "50cm" else 1
 
-    # Find tiles within radius
-    needed = tiles_in_radius(center_e, center_n, radius / 1000)
+    # Find tiles within radius (optionally filtered by wedge)
+    needed = tiles_in_radius(
+        center_e, center_n, radius / 1000,
+        azimuth_center=azimuth_center,
+        azimuth_window=azimuth_window,
+    )
 
     # Pattern to extract tile coordinates from filename
     pattern = re.compile(r"swissalti3d_\d{4}_(\d{4})-(\d{4})_")
@@ -344,8 +438,12 @@ def load_dem_tiles(
     if not tile_files:
         raise FileNotFoundError(f"No DEM tiles found in {tile_dir} for radius {radius}m around ({center_e}, {center_n})")
 
-    # Open all tile datasets
-    datasets = [rasterio.open(f) for f in tile_files]
+    # Open all tile datasets in parallel (I/O bound, so threads work well)
+    def open_tile(path):
+        return rasterio.open(path)
+
+    with ThreadPoolExecutor(max_workers=min(8, len(tile_files))) as executor:
+        datasets = list(executor.map(open_tile, tile_files))
 
     try:
         # Merge tiles into single array
