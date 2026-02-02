@@ -61,8 +61,10 @@ def get_dem_skyline_coords(
     dem_window = dem_window[::-1]
 
     # Convert elevation angles to pixel rows
+    # Apply pitch offset if orientation was optimized
+    pitch_offset = debug.get("pitch_optimized", 0.0) - debug.get("pitch_init", 0.0)
     center_row = h / 2
-    rows = center_row - (dem_window * h / fov_v)
+    rows = center_row - ((dem_window + pitch_offset) * h / fov_v)
     rows = np.clip(rows, 0, h - 1).astype(int)
 
     # Map to image columns
@@ -104,11 +106,19 @@ def draw_dem_skyline(
     highest_x = cols[min_row_idx]
     highest_y = rows[min_row_idx]
 
-    # Draw line segments (dotted or solid)
+    # Draw line segments (dashed or solid)
     if dotted:
-        # Draw dots at regular intervals
-        for i in range(0, len(cols), dot_spacing):
-            cv2.circle(image, (cols[i], rows[i]), thickness, color, -1)
+        # Draw dashed line: alternating segments
+        dash_len = dot_spacing
+        gap_len = dot_spacing // 2
+        i = 0
+        while i < len(cols) - 1:
+            # Draw dash segment
+            end = min(i + dash_len, len(cols) - 1)
+            for j in range(i, end):
+                cv2.line(image, (cols[j], rows[j]), (cols[j + 1], rows[j + 1]), color, thickness)
+            # Skip gap
+            i = end + gap_len
     else:
         for i in range(len(cols) - 1):
             cv2.line(image, (cols[i], rows[i]), (cols[i + 1], rows[i + 1]), color, thickness)
@@ -328,8 +338,8 @@ def main():
     print(f"  Size: {w} x {h}")
 
     # Line thickness settings
-    img_thickness = 4  # Image skylines (solid)
-    dem_thickness = 6  # DEM skylines (dotted)
+    img_thickness = 6   # Image skylines (solid)
+    dem_thickness = 8   # DEM skylines (dashed)
 
     # 1. Lie 2005 image skyline (cyan)
     print("\n[1/4] Detecting Lie 2005 image skyline...")
